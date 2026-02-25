@@ -1,111 +1,155 @@
-console.log("Geriatric Daycare Backend - Starting...");
-
 const express = require("express");
 const cors = require("cors");
+const admin = require("firebase-admin");
 const { v4: uuidv4 } = require("uuid");
 
+// ── Firebase Admin Init ───────────────────────────────────────────────────────
+// We read the service account JSON from an environment variable (set in Render)
+const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
+const db = admin.firestore();
+const bookingsCol = db.collection("bookings");
+
+// ── Express Setup ─────────────────────────────────────────────────────────────
 const app = express();
 
-// ── CORS ──────────────────────────────────────────────────────────────────────
+const allowedOrigins = [
+  process.env.FRONTEND_URL,   // your Vercel URL — set in Render env vars
+  "http://localhost:3000",
+];
+
 app.use(cors({
-  origin: [
-    "https://daycare-frontend-kappa.vercel.app",
-    "http://localhost:3000"  // for local dev
-  ],
+  origin: (origin, callback) => {
+    // allow requests with no origin (like mobile apps or curl)
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
   methods: ["GET", "POST", "DELETE"],
-  allowedHeaders: ["Content-Type"]
+  allowedHeaders: ["Content-Type"],
 }));
 
 app.use(express.json());
-
-// ── In-memory store (replace with Firebase if you want persistence) ────────────
-// NOTE: On Render free tier, data resets on sleep. 
-// To persist, wire up firebase-admin Firestore below.
-let bookings = [];
 
 // ── Health check ──────────────────────────────────────────────────────────────
 app.get("/", (req, res) => {
   res.json({ status: "ok", message: "Geriatric Daycare Backend Running" });
 });
 
-// ── GET /bookings — return all bookings ───────────────────────────────────────
-app.get("/bookings", (req, res) => {
-  res.json(bookings);
+// ── GET /bookings — fetch all bookings from Firestore ─────────────────────────
+app.get("/bookings", async (req, res) => {
+  try {
+    const snapshot = await bookingsCol.orderBy("bookedAt", "desc").get();
+    const bookings = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
+    res.json(bookings);
+  } catch (err) {
+    console.error("GET /bookings error:", err);
+    res.status(500).json({ message: "Failed to fetch bookings" });
+  }
 });
 
 // ── POST /book — create a new booking ────────────────────────────────────────
 // Body: { name, age, phone, slots: ["Monday|9:00–10:00 AM", ...] }
-app.post("/book", (req, res) => {
+app.post("/book", async (req, res) => {
   const { name, age, phone, slots } = req.body;
 
-  // Validation
+  // ── Validation ──
   if (!name || !age || !phone || !slots || !Array.isArray(slots) || slots.length === 0) {
     return res.status(400).json({ message: "Missing required fields: name, age, phone, slots[]" });
   }
-
   const ageNum = parseInt(age);
   if (isNaN(ageNum) || ageNum < 1 || ageNum > 120) {
     return res.status(400).json({ message: "Age must be between 1 and 120" });
   }
-
-  const phone_clean = String(phone).replace(/\D/g, "");
-  if (phone_clean.length < 7 || phone_clean.length > 15) {
+  const phoneClean = String(phone).replace(/\D/g, "");
+  if (phoneClean.length < 7 || phoneClean.length > 15) {
     return res.status(400).json({ message: "Invalid phone number" });
   }
 
-  // Check for duplicate slots (prevent double booking)
-  const alreadyTaken = bookings.flatMap(b => b.slots);
-  const conflicts = slots.filter(s => alreadyTaken.includes(s));
-  if (conflicts.length > 0) {
-    return res.status(409).json({
-      message: "Some slots are already booked",
-      conflicts
-    });
+  try {
+    // ── Check for duplicate slots ──
+    const snapshot = await bookingsCol.get();
+    const allTakenSlots = snapshot.docs.flatMap(doc => doc.data().slots || []);
+    const conflicts = slots.filter(s => allTakenSlots.includes(s));
+
+    if (conflicts.length > 0) {
+      return res.status(409).json({
+        message: "Some slots are already booked",
+        conflicts,
+      });
+    }
+
+    // ── Save to Firestore ──
+    const booking = {
+      name: name.trim(),
+      age: ageNum,
+      phone: phone.trim(),
+      slots,
+      bookedAt: new Date().toISOString(),
+    };
+
+    const docRef = await bookingsCol.add(booking);
+    console.log(`New booking saved: ${docRef.id} — ${name}`);
+    res.status(201).json({ message: "Booked successfully", booking: { id: docRef.id, ...booking } });
+
+  } catch (err) {
+    console.error("POST /book error:", err);
+    res.status(500).json({ message: "Failed to save booking" });
   }
-
-  const booking = {
-    id: uuidv4(),
-    name: name.trim(),
-    age: ageNum,
-    phone: phone.trim(),
-    slots,             // e.g. ["Monday|9:00–10:00 AM", "Wednesday|10:00–11:00 AM"]
-    bookedAt: new Date().toISOString()
-  };
-
-  bookings.push(booking);
-  console.log(`New booking: ${booking.name} — ${booking.slots.join(", ")}`);
-  res.status(201).json({ message: "Booked successfully", booking });
 });
 
 // ── DELETE /bookings/:id — cancel a booking ───────────────────────────────────
-app.delete("/bookings/:id", (req, res) => {
+app.delete("/bookings/:id", async (req, res) => {
   const { id } = req.params;
-  const index = bookings.findIndex(b => b.id === id);
-  if (index === -1) {
-    return res.status(404).json({ message: "Booking not found" });
+  try {
+    const doc = await bookingsCol.doc(id).get();
+    if (!doc.exists) {
+      return res.status(404).json({ message: "Booking not found" });
+    }
+    await bookingsCol.doc(id).delete();
+    res.json({ message: "Booking cancelled" });
+  } catch (err) {
+    console.error("DELETE /bookings error:", err);
+    res.status(500).json({ message: "Failed to cancel booking" });
   }
-  bookings.splice(index, 1);
-  res.json({ message: "Booking cancelled" });
 });
 
-// ── GET /export — download bookings as CSV ────────────────────────────────────
-app.get("/export", (req, res) => {
-  const escape = (val) => `"${String(val ?? "").replace(/"/g, '""')}"`;
+// ── GET /export — download all bookings as CSV ────────────────────────────────
+app.get("/export", async (req, res) => {
+  try {
+    const snapshot = await bookingsCol.orderBy("bookedAt", "desc").get();
+    const bookings = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
 
-  const rows = [["ID", "Name", "Age", "Phone", "Day", "Slot", "Booked At"]];
-  bookings.forEach(b => {
-    b.slots.forEach(s => {
-      const [day, slot] = s.split("|");
-      rows.push([b.id, b.name, b.age, b.phone, day, slot, new Date(b.bookedAt).toLocaleString("en-IN")]);
+    const escape = (val) => `"${String(val ?? "").replace(/"/g, '""')}"`;
+    const rows = [["ID", "Name", "Age", "Phone", "Day", "Time Slot", "Booked At"]];
+
+    bookings.forEach(b => {
+      (b.slots || []).forEach(s => {
+        const [day, slot] = s.split("|");
+        rows.push([
+          b.id, b.name, b.age, b.phone, day, slot,
+          new Date(b.bookedAt).toLocaleString("en-IN"),
+        ]);
+      });
     });
-  });
 
-  const csv = rows.map(r => r.map(escape).join(",")).join("\n");
-  res.setHeader("Content-Type", "text/csv");
-  res.setHeader("Content-Disposition", `attachment; filename=bookings-${new Date().toISOString().slice(0,10)}.csv`);
-  res.send(csv);
+    const csv = rows.map(r => r.map(escape).join(",")).join("\n");
+    res.setHeader("Content-Type", "text/csv");
+    res.setHeader("Content-Disposition", `attachment; filename=bookings-${new Date().toISOString().slice(0, 10)}.csv`);
+    res.send(csv);
+
+  } catch (err) {
+    console.error("GET /export error:", err);
+    res.status(500).json({ message: "Failed to export" });
+  }
 });
 
-// ── Start server ──────────────────────────────────────────────────────────────
+// ── Start ─────────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
